@@ -1,0 +1,110 @@
+name: Build Siren APK
+
+# Works two ways:
+#  1) You upload Siren.zip to the repo as-is (the workflow unzips the newest zip and builds it)
+#  2) You commit the extracted project (settings.gradle.kts at the repo root)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: siren-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Locate project (unzips the newest uploaded zip if needed)
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f settings.gradle.kts ]; then
+            echo "dir=$PWD" >> "$GITHUB_OUTPUT"
+            echo "Building extracted project at repo root"
+            exit 0
+          fi
+          # Newest committed zip wins, so re-uploading a new Siren.zip just works
+          ZIP=""
+          while IFS= read -r f; do
+            if [ -n "$f" ] && [ -f "$f" ]; then ZIP="$f"; break; fi
+          done < <(git log --diff-filter=AM --name-only --format= -- '*.zip' '**/*.zip')
+          if [ -z "$ZIP" ]; then
+            ZIP="$(find . -name '*.zip' -not -path './.git/*' | head -n1 || true)"
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "::error::No settings.gradle.kts or project zip found in the repo"
+            exit 1
+          fi
+          echo "Using zip: $ZIP"
+          rm -rf "$RUNNER_TEMP/src" && mkdir -p "$RUNNER_TEMP/src"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/src"
+          SETTINGS="$(find "$RUNNER_TEMP/src" -name settings.gradle.kts -not -path '*/build/*' | head -n1)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::The zip does not contain settings.gradle.kts"
+            exit 1
+          fi
+          echo "dir=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle 8.12
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.12"
+
+      - name: Warm up JitPack (NewPipe Extractor)
+        continue-on-error: true
+        run: |
+          H=e8f89145a830b4d6cae32412007f24ea8b36c73a
+          curl -sSL --retry 5 --retry-delay 10 --max-time 900 \
+            "https://jitpack.io/com/github/TeamNewPipe/NewPipeExtractor/$H/NewPipeExtractor-$H.pom" -o /dev/null || true
+
+      - name: Build release APK
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: gradle :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Collect APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$(ls -1 "${{ steps.locate.outputs.dir }}"/app/build/outputs/apk/release/*.apk | head -n1)"
+          mkdir -p out
+          cp "$SRC" out/Siren.apk
+          echo "path=$PWD/out/Siren.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Siren-apk
+          path: out/Siren.apk
+          if-no-files-found: error
+
+      - name: Publish to Releases (phone-friendly download)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest "${{ steps.apk.outputs.path }}" \
+            --target "${{ github.sha }}" \
+            --title "Siren - latest build" \
+            --notes "Built from ${{ github.sha }} (run #${{ github.run_number }}). Download Siren.apk and install. Updates install over the old version." \
+            --latest
